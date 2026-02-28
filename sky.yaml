@@ -56,4 +56,4 @@ run: |
 
   torchrun --nproc-per-node 8 \
     pretrain.py \
-    +experiment=${HRM_EXPERIMENT:-sudoku_full_lr3e4_Lc8}
+    +experiment=${HRM_EXPERIMENT:-sdk_full_lr3e4_Lc8}
