@@ -1,0 +1,54 @@
+name: hrm-sudoku
+
+resources:
+  cloud: kubernetes
+  cpus: 8
+  memory: 64
+  accelerators: H100:8
+  disk_size: 100
+  # kueue labels and PVC mount (/nemo-workspace) are in ~/.sky/config.yaml
+
+num_nodes: 1
+
+envs:
+  WANDB_API_KEY: ""
+  WANDB_ENTITY: "LoopTF-4-CSPs"
+  OMP_NUM_THREADS: 8
+
+workdir: .
+
+setup: |
+  set -ex
+  echo "=== HRM Sudoku Training Setup ==="
+
+  # Install PyTorch + CUDA 12.6
+  pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
+  pip install flash-attn --no-build-isolation
+  pip install -r requirements.txt
+
+  # Build dataset from HuggingFace (public, no credentials needed)
+  echo "=== Building Sudoku dataset ==="
+  python dataset/build_sudoku_dataset.py \
+    --output-dir data/sudoku-extreme-1k-aug-1000 \
+    --subsample-size 1000 --num-aug 1000
+
+  echo "=== Setup complete ==="
+
+run: |
+  set -ex
+  echo "=== HRM Sudoku Training ==="
+
+  nvidia-smi --query-gpu=name,memory.total --format=csv
+
+  # W&B fallback to offline if no key
+  if [ -z "${WANDB_API_KEY:-}" ]; then
+    unset WANDB_API_KEY
+    export WANDB_MODE=offline
+    echo "W&B offline mode"
+  fi
+
+  export PYTHONUNBUFFERED=1
+
+  torchrun --nproc-per-node 8 \
+    pretrain.py \
+    +experiment=${HRM_EXPERIMENT:-sudoku_1k_lr7e5_wd1}

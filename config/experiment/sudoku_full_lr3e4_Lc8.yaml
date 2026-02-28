@@ -1,0 +1,19 @@
+# @package _global_
+data_path: data/sudoku-hard-full
+project_name: hrm-sudoku
+global_batch_size: 2304
+epochs: 100
+eval_interval: 10
+checkpoint_every_eval: true
+checkpoint_path: /nemo-workspace/inf-evolve/hrm/checkpoints
+lr: 3e-4
+lr_min_ratio: 0.1
+puzzle_emb_lr: 3e-4
+weight_decay: 0.1
+puzzle_emb_weight_decay: 0.1
+arch:
+  loss:
+    loss_type: softmax_cross_entropy
+  L_cycles: 8
+  halt_max_steps: 8
+  pos_encodings: learned
