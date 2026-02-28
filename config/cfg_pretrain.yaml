@@ -2,6 +2,7 @@
 
 defaults:
   - arch: hrm_v1
+  - optional experiment: null
   - _self_
 
 hydra:

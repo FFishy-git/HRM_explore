@@ -26,11 +26,16 @@ setup: |
   pip install flash-attn --no-build-isolation
   pip install -r requirements.txt
 
-  # Build dataset from HuggingFace (public, no credentials needed)
-  echo "=== Building Sudoku dataset ==="
-  python dataset/build_sudoku_dataset.py \
-    --output-dir data/sudoku-extreme-1k-aug-1000 \
-    --subsample-size 1000 --num-aug 1000
+  # Build dataset on PVC (persists across runs) and symlink into workdir
+  DATA_PVC=/nemo-workspace/inf-evolve/hrm/data/sudoku-hard-full
+  if [ -f "$DATA_PVC/train/dataset.json" ]; then
+    echo "=== Dataset already exists on PVC, skipping build ==="
+  else
+    echo "=== Building Sudoku dataset on PVC ==="
+    python dataset/build_sudoku_dataset.py \
+      --output-dir "$DATA_PVC"
+  fi
+  ln -sfn "$DATA_PVC" data/sudoku-hard-full
 
   echo "=== Setup complete ==="
 
@@ -51,4 +56,4 @@ run: |
 
   torchrun --nproc-per-node 8 \
     pretrain.py \
-    +experiment=${HRM_EXPERIMENT:-sudoku_1k_lr7e5_wd1}
+    +experiment=${HRM_EXPERIMENT:-sudoku_full_lr3e4_Lc8}
