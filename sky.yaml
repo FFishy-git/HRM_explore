@@ -6,6 +6,7 @@ resources:
   memory: 64
   accelerators: H100:8
   disk_size: 100
+  image_id: nvcr.io/nvidia/pytorch:26.02-py3
   # kueue labels and PVC mount (/nemo-workspace) are in ~/.sky/config.yaml
 
 num_nodes: 1
@@ -21,9 +22,9 @@ setup: |
   set -ex
   echo "=== HRM Sudoku Training Setup ==="
 
-  # Install PyTorch + CUDA 12.6
-  pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
-  pip install flash-attn --no-build-isolation
+  # NGC image provides PyTorch, CUDA toolkit, and flash-attn
+  # adam-atan2 needs CUDA compilation from source (PyPI wheel lacks CUDA extensions)
+  pip install git+https://github.com/imoneoi/adam-atan2.git --no-build-isolation
   pip install -r requirements.txt
 
   # Build dataset on PVC (persists across runs) and symlink into workdir
@@ -35,6 +36,7 @@ setup: |
     python dataset/build_sudoku_dataset.py \
       --output-dir "$DATA_PVC"
   fi
+  mkdir -p data
   ln -sfn "$DATA_PVC" data/sudoku-hard-full
 
   echo "=== Setup complete ==="
@@ -56,4 +58,4 @@ run: |
 
   torchrun --nproc-per-node 8 \
     pretrain.py \
-    +experiment=${HRM_EXPERIMENT:-sdk_full_lr3e4_Lc8}
+    experiment=${HRM_EXPERIMENT:-sdk_full_lr3e4_Lc8}

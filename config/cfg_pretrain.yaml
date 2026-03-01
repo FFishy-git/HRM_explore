@@ -1,9 +1,9 @@
 # ARC training config
 
 defaults:
+  - _self_
   - arch: hrm_v1
   - optional experiment: null
-  - _self_
 
 hydra:
   output_subdir: null
