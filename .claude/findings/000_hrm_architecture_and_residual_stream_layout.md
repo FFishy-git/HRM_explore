@@ -55,7 +55,15 @@ content:  puz_0   puz_1   ...  puz_{L-1} tok_0   tok_1   ...  tok_{seq_len-1}
 
 where `L = puzzle_emb_len = ceil(puzzle_emb_ndim / hidden_size)`.
 
-The puzzle prefix positions are learned per-puzzle context vectors (via `CastedSparseEmbedding`), reshaped to fill `puzzle_emb_len` positions of width `hidden_size`. They are **not tokens to predict** — the **labels** tensor from the dataset has shape `[batch, seq_len]` covering only the token positions.
+The puzzle prefix is a **learned task-type embedding**, not a per-instance encoding. The flow:
+
+1. Each example carries a `puzzle_identifiers` integer (shape `[batch]`) indicating its puzzle type.
+2. `CastedSparseEmbedding` (`models/sparse_embedding.py:11-38`) maintains a weight table of shape `[num_puzzle_identifiers, puzzle_emb_ndim]` and looks up `weights[puzzle_identifiers]` → shape `[batch, puzzle_emb_ndim]`.
+3. The result is reshaped to `[batch, puzzle_emb_len, hidden_size]` (zero-padded if `puzzle_emb_ndim` is not a multiple of `hidden_size`) and prepended to the token embeddings.
+
+**For sudoku**, `num_puzzle_identifiers = 1` and every example has `puzzle_identifiers = 0` (`build_sudoku_dataset.py:109`). The embedding table is a single row `[1, 512]`, so every sudoku instance in every batch receives the **exact same** prefix vector — effectively a learned "I am a sudoku" context token. In contrast, multi-task datasets like ARC assign distinct identifiers per puzzle type (`build_arc_dataset.py:240`), giving each type its own learned prefix.
+
+The puzzle prefix positions are **not tokens to predict** — the **labels** tensor from the dataset has shape `[batch, seq_len]` covering only the token positions.
 
 This layout means:
 - **Positions `0..L-1`** (puzzle prefix): participate in bidirectional self-attention (causal=False) with all positions, serving as global context. Position 0 is used as a CLS-like summary token by `q_head`.
@@ -72,17 +80,36 @@ q_logits = self.q_head(z_H[:, 0]).to(torch.float32)    # ACT halt/continue — [
 
 The `[:, puzzle_emb_len:]` slice strips the puzzle prefix so the logits align with the `[batch, seq_len]` labels tensor. `q_head` reads position 0 (first puzzle prefix position) as a CLS token for the halt/continue Q-value.
 
-**Only z_H is decoded.** z_L is never directly projected through an unembedding matrix. z_L influences z_H indirectly via the H_level reasoning module: `z_H = H_level(z_H, z_L)`, where z_L is the `input_injection` that gets added in `ReasoningModule.forward` (line 123-125):
+**Only z_H is decoded.** z_L is never directly projected through an unembedding matrix. Both levels use the same `ReasoningModule.forward` (line 123-125), which adds `input_injection` to `hidden_states` before passing through transformer layers:
 
 ```python
 def forward(self, hidden_states, input_injection, **kwargs):
-    hidden_states = hidden_states + input_injection  # z_L injected here
+    hidden_states = hidden_states + input_injection
     for layer in self.layers:
         hidden_states = layer(hidden_states=hidden_states, **kwargs)
     return hidden_states
 ```
 
-Similarly, z_H feeds into L_level as input_injection: `z_L = L_level(z_L, z_H + input_embeddings)`.
+Tracing through the call sites:
+
+- **H_level** (`z_H = H_level(z_H, z_L)`): `hidden_states=z_H`, `input_injection=z_L` → transformer layers receive **z_H + z_L**
+- **L_level** (`z_L = L_level(z_L, z_H + input_embeddings)`): `hidden_states=z_L`, `input_injection=z_H + input_embeddings` → transformer layers receive **z_L + z_H + input_embeddings**
+
+| Level | Call signature | Transformer layers actually see |
+|-------|---------------|-------------------------------|
+| **H_level** | `H_level(z_H, z_L)` | **z_H + z_L** |
+| **L_level** | `L_level(z_L, z_H + input_embeddings)` | **z_H + z_L + input_embeddings** |
+
+**Key asymmetry:** `input_embeddings` (token + puzzle embeddings) is only injected into L_level, and it is re-injected on every L_level call. This means L_level is re-anchored to the raw input at every cycle, while H_level never directly sees the token embeddings — it only accesses them indirectly through whatever z_L has absorbed. H_level is a purely "abstract" reasoning stream operating over the two residual states; L_level is the token-grounded stream.
+
+### Embedding and Unembedding Are Position-Agnostic
+
+Both the embedding and unembedding are single shared matrices applied uniformly across all sequence positions — there is no per-cell specialization:
+
+- **Embedding** (`embed_tokens`): a single `CastedEmbedding(vocab_size, hidden_size)` with weight shape `[vocab_size, hidden_size]`. Every cell's token indexes into the same table.
+- **Unembedding** (`lm_head`): a single `CastedLinear(hidden_size, vocab_size, bias=False)` with weight shape `[vocab_size, hidden_size]`. Applied via `F.linear` broadcast across all token positions with the same weights.
+
+For sudoku, this means the same `[11, 512]` matrix embeds all 81 cells, and the same `[11, 512]` matrix decodes all 81 cells. The model differentiates cells solely through **positional encodings** (learned `embed_pos` or RoPE) and **attention**, which route cell-specific information through the residual streams.
 
 ### The Two Unembedding Matrices
 
@@ -130,7 +157,8 @@ From `config/arch/hrm_v1.yaml` and `dataset/build_sudoku_dataset.py`:
 - On subsequent ACT steps, they carry forward as **detached** outputs from the previous step
 - The sequence dimension has a **puzzle prefix** (positions `0..L-1`) prepended before **token positions** (`L..L+seq_len-1`)
 - Only **z_H** is decoded: `lm_head` reads token positions, `q_head` reads position 0
-- z_L influences z_H indirectly via input injection in `H_level`; z_H similarly feeds into `L_level`
+- H_level transformer layers receive **z_H + z_L**; L_level layers receive **z_H + z_L + input_embeddings**
+- **Asymmetry**: `input_embeddings` is re-injected into L_level every cycle (token-grounded), while H_level never directly sees token embeddings (abstract reasoning over residual states only)
 - For sudoku: hidden_size=512, vocab_size=11, seq_len=81, puzzle_emb_len=1
 
 ## Related Files
