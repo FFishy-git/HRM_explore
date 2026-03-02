@@ -726,6 +726,30 @@ if __name__ == "__main__":
             for k, v in set_metrics.items():
                 print(f"    {k}: {v:.6f}")
 
+        # Log evaluation metrics to wandb
+        if args.wandb_project:
+            import wandb
+            for set_name, set_metrics in metrics.items():
+                wandb.log({f"eval/{set_name}/{k}": v for k, v in set_metrics.items()})
+
+            # Log norm results per ACT step (grad-step, final H cycle only)
+            for n in norm_results:
+                if n["is_grad_step"] and n["h_cycle"] > 0:
+                    wandb.log({
+                        "norms/z_H_norm_mean": n["z_H_norm_mean"],
+                        "norms/z_H_norm_std":  n["z_H_norm_std"],
+                        "norms/z_H_norm_min":  n["z_H_norm_min"],
+                        "norms/z_H_norm_max":  n["z_H_norm_max"],
+                        "norms/z_L_norm_mean": n["z_L_norm_mean"],
+                        "norms/z_L_norm_std":  n["z_L_norm_std"],
+                        "norms/z_L_norm_min":  n["z_L_norm_min"],
+                        "norms/z_L_norm_max":  n["z_L_norm_max"],
+                        "norms/cosine_sim_mean": n["cosine_sim_mean"],
+                        "norms/cosine_sim_std":  n["cosine_sim_std"],
+                        "norms/cosine_sim_min":  n["cosine_sim_min"],
+                        "norms/cosine_sim_max":  n["cosine_sim_max"],
+                    }, step=n["act_step"])
+
         # Print residual norm summary per ACT step (grad-step H hooks only)
         print("\n=== Residual Norm Benchmark (per ACT step, H grad-step) ===")
         print(f"  {'step':>4}  {'z_H mean':>9} {'z_H std':>8} {'z_H min':>8} {'z_H max':>8}"
