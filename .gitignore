@@ -1,5 +1,7 @@
 # Claude Code
-.claude/
+.claude/*
+!.claude/findings/
+!.claude/tips/
 
 # WandB
 /wandb/

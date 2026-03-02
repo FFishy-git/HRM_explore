@@ -1,0 +1,12 @@
+{
+  "next_id": 2,
+  "tips": [
+    {
+      "id": 1,
+      "tag": "hrm-inspect",
+      "title": "Run hrm_inspect.py locally",
+      "content": "```bash\n# Inspect mode (one batch, all hooks)\ncd /home/developer/HRM_explore\npython hrm_inspect.py \\\n  --checkpoint /nemo-workspace/inf-evolve/hrm/checkpoints/step_166310 \\\n  --data-path /nemo-workspace/inf-evolve/hrm/data/sudoku-hard-full \\\n  --mode inspect \\\n  --batch-size 32\n\n# With wandb logging\npython hrm_inspect.py \\\n  --checkpoint /nemo-workspace/inf-evolve/hrm/checkpoints/step_166310 \\\n  --data-path /nemo-workspace/inf-evolve/hrm/data/sudoku-hard-full \\\n  --mode inspect \\\n  --wandb-project hrm-inspect\n\n# Evaluate mode (full test set)\npython hrm_inspect.py \\\n  --checkpoint /nemo-workspace/inf-evolve/hrm/checkpoints/step_166310 \\\n  --data-path /nemo-workspace/inf-evolve/hrm/data/sudoku-hard-full \\\n  --mode evaluate \\\n  --batch-size 2304\n```\n\nNote: `--data-path` is required because the checkpoint config has a relative path (`data/sudoku-hard-full`) that doesn't resolve from the project directory.\n\nAvailable checkpoints: `step_16631` through `step_166310` (10 checkpoints, every 16631 steps).",
+      "created": "2026-03-02T07:13:20Z"
+    }
+  ]
+}

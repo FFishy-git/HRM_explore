@@ -1,0 +1,29 @@
+{
+  "next_id": 4,
+  "documents": [
+    {
+      "id": 1,
+      "filename": "001_unembedding_subspace_degeneration_analysis.md",
+      "title": "Unembedding Subspace Degeneration Analysis for HRM",
+      "created": "2026-03-02T05:50:39Z",
+      "dependencies": [],
+      "all_ancestors": []
+    },
+    {
+      "id": 2,
+      "filename": "002_eval_zh_projection_to_lm_head_subspace.md",
+      "title": "Evaluation with z_H Projection to lm_head Subspace",
+      "created": "2026-03-02T09:39:36Z",
+      "dependencies": [1],
+      "all_ancestors": [1]
+    },
+    {
+      "id": 3,
+      "filename": "003_finetune_with_fixed_embedding_and_zh_projection.md",
+      "title": "Finetuning with Fixed Embedding and z_H Projection",
+      "created": "2026-03-02T09:39:36Z",
+      "dependencies": [1, 2],
+      "all_ancestors": [1, 2]
+    }
+  ]
+}
