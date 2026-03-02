@@ -729,26 +729,29 @@ if __name__ == "__main__":
         # Log evaluation metrics to wandb
         if args.wandb_project:
             import wandb
-            for set_name, set_metrics in metrics.items():
-                wandb.log({f"eval/{set_name}/{k}": v for k, v in set_metrics.items()})
+            from collections import defaultdict
 
-            # Log norm results per ACT step (grad-step, final H cycle only)
+            # Log eval metrics as summary (not stepped)
+            for set_name, set_metrics in metrics.items():
+                for k, v in set_metrics.items():
+                    wandb.summary[f"eval/{set_name}/{k}"] = v
+
+            # Aggregate norm results across batches per ACT step, then log once
+            norm_agg = defaultdict(lambda: defaultdict(list))
+            norm_keys = ["z_H_norm_mean", "z_H_norm_std", "z_H_norm_min", "z_H_norm_max",
+                         "z_L_norm_mean", "z_L_norm_std", "z_L_norm_min", "z_L_norm_max",
+                         "cosine_sim_mean", "cosine_sim_std", "cosine_sim_min", "cosine_sim_max"]
             for n in norm_results:
                 if n["is_grad_step"] and n["h_cycle"] > 0:
-                    wandb.log({
-                        "norms/z_H_norm_mean": n["z_H_norm_mean"],
-                        "norms/z_H_norm_std":  n["z_H_norm_std"],
-                        "norms/z_H_norm_min":  n["z_H_norm_min"],
-                        "norms/z_H_norm_max":  n["z_H_norm_max"],
-                        "norms/z_L_norm_mean": n["z_L_norm_mean"],
-                        "norms/z_L_norm_std":  n["z_L_norm_std"],
-                        "norms/z_L_norm_min":  n["z_L_norm_min"],
-                        "norms/z_L_norm_max":  n["z_L_norm_max"],
-                        "norms/cosine_sim_mean": n["cosine_sim_mean"],
-                        "norms/cosine_sim_std":  n["cosine_sim_std"],
-                        "norms/cosine_sim_min":  n["cosine_sim_min"],
-                        "norms/cosine_sim_max":  n["cosine_sim_max"],
-                    }, step=n["act_step"])
+                    for k in norm_keys:
+                        norm_agg[n["act_step"]][k].append(n[k])
+
+            for act_step in sorted(norm_agg.keys()):
+                row = {}
+                for k in norm_keys:
+                    vals = norm_agg[act_step][k]
+                    row[f"norms/{k}"] = sum(vals) / len(vals)
+                wandb.log(row, step=act_step)
 
         # Print residual norm summary per ACT step (grad-step H hooks only)
         print("\n=== Residual Norm Benchmark (per ACT step, H grad-step) ===")
