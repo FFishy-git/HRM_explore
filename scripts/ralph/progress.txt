@@ -10,6 +10,7 @@ Started: Mon Mar  2 21:40:39 CST 2026
 - HookContext dataclass uses `Optional[torch.Tensor] = None` for fields that should be backward-compatible (existing hooks ignore new fields)
 - `input_embeddings` is computed in `_Inner.forward()` at the start and passed to all HookContext sites
 - The `collect_residual_streams` hook in `hrm_inspect.py` constructs HookContext with keyword args — new fields must have defaults to avoid breaking it
+- In forward(), grad-step L-hook fires before H-level (ctx.z_H = z_H_before), grad-step H-hook fires after H-level (ctx.z_H = z_H_after/z_H*)
 
 ## 2026-03-02 - US-001
 - Implemented `ProbingMLP` class in `models/probing.py`
@@ -34,4 +35,20 @@ Started: Mon Mar  2 21:40:39 CST 2026
   - `collect_residual_streams` in hrm_inspect.py constructs HookContext with keyword args — new fields MUST have defaults
   - `input_embeddings` variable is in scope at all 4 hook sites because it's computed at the top of `forward()` (line 252)
   - The `Optional[torch.Tensor] = None` pattern ensures backward compatibility while still passing the tensor when available
+---
+
+## 2026-03-02 - US-003
+- Created `probe_train.py` with residual stream extraction hooks
+- `ProbeData` dataclass holds z_H_before, z_H_after, z_L, input_embeddings per ACT step
+- `create_probe_hooks(skip_steps, to_cpu)` returns L and H hook callbacks plus storage list
+- L-hook captures z_H_before (carry-in z_H before H-level) and z_L at grad-step
+- H-hook captures z_H_after (z_H* after H-level) at grad-step, assembles ProbeData
+- Uses _pending dict to buffer L-hook data until H-hook fires for same ACT step
+- Tensors are detached and optionally moved to CPU to avoid OOM
+- Files changed: `probe_train.py` (new)
+- **Learnings for future iterations:**
+  - In hrm_act_v2.py forward(), grad-step L-hook fires BEFORE H-level, so ctx.z_H is the carry-in z_H_before
+  - Grad-step H-hook fires AFTER H-level, so ctx.z_H is z_H* (z_H_after)
+  - L-hook always fires before H-hook within the same ACT step (line 273-279), making _pending buffer safe
+  - input_embeddings can be None if an older checkpoint's hooks are used; guard with fallback
 ---
