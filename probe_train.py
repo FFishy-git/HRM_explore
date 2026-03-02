@@ -206,11 +206,18 @@ def train_probe(args) -> None:
     print(f"  hidden_size={hidden_size}, puzzle_emb_len={puzzle_emb_len}")
 
     # --- Create probe ---
-    probe = ProbingMLP(hidden_size=hidden_size).to(device)
     if args.probe_checkpoint:
         print(f"Resuming probe from {args.probe_checkpoint}")
         ckpt = torch.load(args.probe_checkpoint, map_location=device, weights_only=True)
+        probe_config = ckpt["config"]
+        probe = ProbingMLP(
+            hidden_size=probe_config["hidden_size"],
+            hidden_mult=probe_config["hidden_mult"],
+            num_classes=probe_config["num_classes"],
+        ).to(device)
         probe.load_state_dict(ckpt["state_dict"])
+    else:
+        probe = ProbingMLP(hidden_size=hidden_size).to(device)
 
     optimizer = torch.optim.AdamW(probe.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
@@ -304,7 +311,12 @@ def train_probe(args) -> None:
         else:
             print(f"Epoch {epoch+1}/{args.epochs}  no data collected")
 
-    # Save final probe checkpoint
+        # Interval checkpoint saving
+        if args.save_interval > 0 and (epoch + 1) % args.save_interval == 0:
+            interval_path = args.output.replace(".pt", f"_epoch{epoch+1}.pt")
+            _save_probe(probe, interval_path)
+
+    # Save final probe checkpoint (always)
     _save_probe(probe, args.output if hasattr(args, 'output') and args.output else "probe_checkpoint.pt")
 
     if use_wandb:
@@ -506,6 +518,8 @@ if __name__ == "__main__":
                         help="Path to saved probe checkpoint (resume training or eval)")
     parser.add_argument("--output", type=str, default="probe_checkpoint.pt",
                         help="Output path for probe checkpoint (default: probe_checkpoint.pt)")
+    parser.add_argument("--save-interval", type=int, default=0,
+                        help="Save probe checkpoint every N epochs (0 = only at end, default: 0)")
 
     # Wandb
     parser.add_argument("--wandb-project", type=str, default=None,
