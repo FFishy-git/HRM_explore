@@ -312,6 +312,148 @@ def train_probe(args) -> None:
         wandb.finish()
 
 
+# ──────────────────────── Evaluation ──────────────────────────────────────
+
+
+def eval_probe(args) -> None:
+    """Evaluate a trained probe with per-ACT-step metrics for z_H vs z_H*."""
+    from hrm_inspect import load_model, load_sudoku_batch
+    from models.probing import ProbingMLP
+
+    if not args.probe_checkpoint:
+        print("Error: --probe-checkpoint is required for eval mode")
+        raise SystemExit(1)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # --- Load frozen HRM ---
+    print(f"Loading HRM checkpoint from {args.checkpoint} ...")
+    model = load_model(args.checkpoint, data_path=args.data, device=str(device))
+    model.eval()
+    model.requires_grad_(False)
+    puzzle_emb_len = model.puzzle_emb_len
+    hidden_size = model.config.hidden_size
+    print(f"  hidden_size={hidden_size}, puzzle_emb_len={puzzle_emb_len}")
+
+    # --- Load saved probe ---
+    print(f"Loading probe from {args.probe_checkpoint} ...")
+    ckpt = torch.load(args.probe_checkpoint, map_location=device, weights_only=True)
+    probe_config = ckpt["config"]
+    probe = ProbingMLP(
+        hidden_size=probe_config["hidden_size"],
+        hidden_mult=probe_config["hidden_mult"],
+        num_classes=probe_config["num_classes"],
+    ).to(device)
+    probe.load_state_dict(ckpt["state_dict"])
+    probe.eval()
+
+    # --- Optional wandb ---
+    use_wandb = args.wandb_project is not None
+    if use_wandb:
+        import wandb
+        wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=args.wandb_name or "probe-eval",
+            config=vars(args),
+            settings=wandb.Settings(_disable_stats=True),
+        )
+
+    # --- Create hooks ---
+    hooks_dict, storage = create_probe_hooks(skip_steps=args.skip_act_steps, to_cpu=False)
+
+    # --- Evaluate ---
+    num_steps = args.act_steps if args.act_steps else model.config.halt_max_steps
+    print(f"Evaluating: act_steps={num_steps}, skip_steps={args.skip_act_steps}")
+
+    # Per-step accumulators: step -> {loss_before, loss_after, acc_before, acc_after, count}
+    step_metrics: Dict[int, Dict[str, float]] = {}
+
+    with torch.no_grad():
+        for batch in load_sudoku_batch(args.data, batch_size=args.batch_size, split="train"):
+            batch = {k: v.to(device) for k, v in batch.items()}
+
+            _run_act_loop_with_hooks(model, batch, hooks_dict, storage, num_steps)
+            if not storage:
+                continue
+
+            labels = batch["labels"]
+            blank_mask = batch["inputs"] == 1
+
+            for probe_data in storage:
+                step = probe_data.act_step
+                before_input, after_input = _form_probe_inputs(probe_data, puzzle_emb_len, device)
+
+                loss_before, acc_before = _compute_probe_loss(probe, before_input, labels, blank_mask)
+                loss_after, acc_after = _compute_probe_loss(probe, after_input, labels, blank_mask)
+
+                if step not in step_metrics:
+                    step_metrics[step] = {
+                        "loss_before": 0.0, "loss_after": 0.0,
+                        "acc_before": 0.0, "acc_after": 0.0,
+                        "count": 0.0,
+                    }
+                m = step_metrics[step]
+                m["loss_before"] += loss_before.item()
+                m["loss_after"] += loss_after.item()
+                m["acc_before"] += acc_before
+                m["acc_after"] += acc_after
+                m["count"] += 1
+
+    # --- Print summary table ---
+    print()
+    print("=" * 72)
+    print(f"{'ACT Step':>10} | {'acc(z_H)':>10} | {'acc(z_H*)':>10} | {'delta':>10} | {'loss(z_H)':>10} | {'loss(z_H*)':>10}")
+    print("-" * 72)
+
+    sorted_steps = sorted(step_metrics.keys())
+    for step in sorted_steps:
+        m = step_metrics[step]
+        c = m["count"]
+        avg_acc_before = m["acc_before"] / c
+        avg_acc_after = m["acc_after"] / c
+        avg_loss_before = m["loss_before"] / c
+        avg_loss_after = m["loss_after"] / c
+        delta = avg_acc_after - avg_acc_before
+        print(
+            f"{step:>10} | {avg_acc_before:>10.4f} | {avg_acc_after:>10.4f} | "
+            f"{delta:>+10.4f} | {avg_loss_before:>10.4f} | {avg_loss_after:>10.4f}"
+        )
+
+        if use_wandb:
+            import wandb
+            wandb.log({
+                f"eval/step_{step}/acc_z_H": avg_acc_before,
+                f"eval/step_{step}/acc_z_H_star": avg_acc_after,
+                f"eval/step_{step}/acc_delta": delta,
+                f"eval/step_{step}/loss_z_H": avg_loss_before,
+                f"eval/step_{step}/loss_z_H_star": avg_loss_after,
+            })
+
+    print("=" * 72)
+
+    # Overall summary
+    if sorted_steps:
+        total_count = sum(step_metrics[s]["count"] for s in sorted_steps)
+        overall_acc_before = sum(step_metrics[s]["acc_before"] for s in sorted_steps) / total_count
+        overall_acc_after = sum(step_metrics[s]["acc_after"] for s in sorted_steps) / total_count
+        print(
+            f"{'Overall':>10} | {overall_acc_before:>10.4f} | {overall_acc_after:>10.4f} | "
+            f"{overall_acc_after - overall_acc_before:>+10.4f} |"
+        )
+        if use_wandb:
+            import wandb
+            wandb.log({
+                "eval/overall/acc_z_H": overall_acc_before,
+                "eval/overall/acc_z_H_star": overall_acc_after,
+                "eval/overall/acc_delta": overall_acc_after - overall_acc_before,
+            })
+
+    if use_wandb:
+        import wandb
+        wandb.finish()
+
+
 def _save_probe(probe: "ProbingMLP", path: str) -> None:
     """Save probe state_dict and config."""
     torch.save({
@@ -378,5 +520,4 @@ if __name__ == "__main__":
     if args.mode == "train":
         train_probe(args)
     elif args.mode == "eval":
-        print("Eval mode not yet implemented (see US-005)")
-        raise SystemExit(1)
+        eval_probe(args)
