@@ -405,6 +405,188 @@ def compute_residual_norms() -> Tuple[HookCallback, List[Dict]]:
     return hook, norms
 
 
+# ──────────────────────── Unembedding projection hooks ────────────────────────
+
+def _build_basis(W: torch.Tensor) -> Tuple[torch.Tensor, int]:
+    """Compute orthonormal basis for the row space of W via SVD.
+
+    Args:
+        W: Weight matrix [out_features, hidden_size].
+
+    Returns:
+        (U_basis, rank) where U_basis is [hidden_size, rank] on same device as W.
+    """
+    W_f = W.float()
+    U, S, _ = torch.linalg.svd(W_f.T, full_matrices=False)
+    rank = (S > 1e-6).sum().item()
+    return U[:, :rank], rank
+
+
+def _proj_stats(z: torch.Tensor, U_basis: torch.Tensor) -> Dict[str, float]:
+    """Compute orig_norm, proj_norm, ratio for a [batch, hidden_size] tensor.
+
+    Returns dict with mean/std/min/max for each of the three metrics.
+    """
+    coeffs = z @ U_basis              # [batch, rank]
+    z_proj = coeffs @ U_basis.T       # [batch, hidden_size]
+
+    orig = z.norm(dim=-1)             # [batch]
+    proj = z_proj.norm(dim=-1)        # [batch]
+    ratio = proj / orig.clamp_min(1e-8)
+
+    out = {}
+    for name, vals in [("orig_norm", orig), ("proj_norm", proj), ("ratio", ratio)]:
+        out[f"{name}_mean"] = vals.mean().item()
+        out[f"{name}_std"]  = vals.std().item()
+        out[f"{name}_min"]  = vals.min().item()
+        out[f"{name}_max"]  = vals.max().item()
+    return out
+
+
+def compute_unembed_projection(
+    model: HierarchicalReasoningModel_ACTV1_Inner,
+) -> Tuple[HookCallback, List[Dict]]:
+    """Track projection of z_H/z_L onto lm_head and q_head subspaces separately.
+
+    For each hook firing, records a 2x2 grid:
+      {lm_head, q_head} x {pos0, seq_positions}
+    with orig_norm, proj_norm, ratio (mean/std/min/max over batch).
+
+    For seq positions, per-position norms are averaged over the sequence dim
+    first, then stats are computed over the batch dim.
+
+    Returns:
+        (callback, results_list) — register as both H and L hook.
+    """
+    results: List[Dict] = []
+
+    with torch.no_grad():
+        lm_basis, lm_rank = _build_basis(model.lm_head.weight)
+        q_basis, q_rank   = _build_basis(model.q_head.weight)
+        lm_basis = lm_basis.cuda()
+        q_basis  = q_basis.cuda()
+
+    puzzle_emb_len = model.puzzle_emb_len
+
+    def hook(ctx: HookContext):
+        with torch.no_grad():
+            for stream_name, z in [("z_H", ctx.z_H), ("z_L", ctx.z_L)]:
+                z_f = z.float()  # [batch, seq_total, hidden_size]
+
+                # ── Position 0 ──
+                z_pos0 = z_f[:, 0, :]  # [batch, hidden_size]
+
+                # ── Sequence positions ──
+                z_seq = z_f[:, puzzle_emb_len:, :]  # [batch, seq_len, hidden_size]
+
+                for subspace_name, basis, rank in [
+                    ("lm_head", lm_basis, lm_rank),
+                    ("q_head",  q_basis,  q_rank),
+                ]:
+                    # pos0: direct stats over batch
+                    pos0_stats = _proj_stats(z_pos0, basis)
+
+                    # seq: project per-position, compute norms per-position,
+                    # average over sequence, then stats over batch
+                    coeffs_seq = z_seq @ basis           # [batch, seq_len, rank]
+                    z_proj_seq = coeffs_seq @ basis.T    # [batch, seq_len, hidden_size]
+
+                    orig_per_pos = z_seq.norm(dim=-1)        # [batch, seq_len]
+                    proj_per_pos = z_proj_seq.norm(dim=-1)   # [batch, seq_len]
+                    ratio_per_pos = proj_per_pos / orig_per_pos.clamp_min(1e-8)
+
+                    # Mean over sequence → [batch]
+                    orig_per_sample  = orig_per_pos.mean(dim=-1)
+                    proj_per_sample  = proj_per_pos.mean(dim=-1)
+                    ratio_per_sample = ratio_per_pos.mean(dim=-1)
+
+                    seq_stats = {}
+                    for metric_name, vals in [
+                        ("orig_norm", orig_per_sample),
+                        ("proj_norm", proj_per_sample),
+                        ("ratio",     ratio_per_sample),
+                    ]:
+                        seq_stats[f"{metric_name}_mean"] = vals.mean().item()
+                        seq_stats[f"{metric_name}_std"]  = vals.std().item()
+                        seq_stats[f"{metric_name}_min"]  = vals.min().item()
+                        seq_stats[f"{metric_name}_max"]  = vals.max().item()
+
+                    results.append({
+                        "stream": stream_name,
+                        "act_step": ctx.act_step,
+                        "h_cycle": ctx.h_cycle,
+                        "l_cycle": ctx.l_cycle,
+                        "is_grad_step": ctx.is_grad_step,
+                        "subspace": subspace_name,
+                        "subspace_rank": rank,
+                        "hidden_size": z.shape[-1],
+                        # pos0 metrics
+                        **{f"pos0_{k}": v for k, v in pos0_stats.items()},
+                        # seq metrics (aggregated over sequence)
+                        **{f"seq_{k}": v for k, v in seq_stats.items()},
+                    })
+
+    return hook, results
+
+
+# ──────────────────────────── Wandb logging ──────────────────────────────────
+
+def log_inspect_to_wandb(
+    pred_results: List[Dict],
+    norm_results: List[Dict],
+    proj_results: List[Dict],
+) -> None:
+    """Log all inspect-mode hook results to wandb, keyed by ACT step.
+
+    Logs grad-step results only (the final H/L state per ACT step).
+    Metrics are namespaced as:
+        pred/{metric}
+        norms/{z_H|z_L|cosine}_{stat}
+        proj/{stream}/{subspace}/{pos0|seq}/{metric}_{stat}
+    """
+    import wandb
+
+    # ── Prediction evolution (one entry per ACT step) ──
+    for r in pred_results:
+        wandb.log({
+            "pred/accuracy": r["accuracy"],
+            "pred/exact_accuracy": r["exact_accuracy"],
+            "pred/entropy": r["entropy"],
+        }, step=r["act_step"])
+
+    # ── Residual norms (grad-step H hooks only) ──
+    for n in norm_results:
+        if not n["is_grad_step"]:
+            continue
+        wandb.log({
+            "norms/z_H_norm_mean": n["z_H_norm_mean"],
+            "norms/z_H_norm_std":  n["z_H_norm_std"],
+            "norms/z_H_norm_min":  n["z_H_norm_min"],
+            "norms/z_H_norm_max":  n["z_H_norm_max"],
+            "norms/z_L_norm_mean": n["z_L_norm_mean"],
+            "norms/z_L_norm_std":  n["z_L_norm_std"],
+            "norms/z_L_norm_min":  n["z_L_norm_min"],
+            "norms/z_L_norm_max":  n["z_L_norm_max"],
+            "norms/cosine_sim_mean": n["cosine_sim_mean"],
+            "norms/cosine_sim_std":  n["cosine_sim_std"],
+            "norms/cosine_sim_min":  n["cosine_sim_min"],
+            "norms/cosine_sim_max":  n["cosine_sim_max"],
+        }, step=n["act_step"])
+
+    # ── Unembedding projection (grad-step only) ──
+    for r in proj_results:
+        if not r["is_grad_step"]:
+            continue
+        prefix = f"proj/{r['stream']}/{r['subspace']}"
+        metrics = {}
+        for pos_group in ("pos0", "seq"):
+            for metric in ("orig_norm", "proj_norm", "ratio"):
+                for stat in ("mean", "std", "min", "max"):
+                    key = f"{prefix}/{pos_group}/{metric}_{stat}"
+                    metrics[key] = r[f"{pos_group}_{metric}_{stat}"]
+        wandb.log(metrics, step=r["act_step"])
+
+
 # ──────────────────────────── ACT inference loop ────────────────────────────
 
 def run_act_loop(
@@ -470,9 +652,56 @@ if __name__ == "__main__":
                              "'evaluate': full test set evaluation mirroring evaluate.py.")
     parser.add_argument("--save-path", type=str, default=None,
                         help="Directory to save predictions (evaluate mode).")
+    parser.add_argument("--wandb-project", type=str, default="hrm-sudoku-eval",
+                        help="Wandb project name. Enables wandb logging when set.")
+    parser.add_argument("--wandb-entity", type=str, default="LoopTF-4-CSPs",
+                        help="Wandb entity (team/user).")
+    parser.add_argument("--wandb-name", type=str, default=None,
+                        help="Wandb run name. Default: 'unembed-projection-{step}' "
+                             "derived from checkpoint path.")
     args = parser.parse_args()
 
     data_path = _resolve_data_path(args.checkpoint, args.data_path)
+
+    def _init_wandb(inner_model: HierarchicalReasoningModel_ACTV1_Inner):
+        """Init wandb after model is loaded, so we can log arch config and subspace ranks."""
+        if not args.wandb_project:
+            return
+        import wandb
+
+        run_name = args.wandb_name
+        if run_name is None:
+            run_name = f"unembed-projection-{os.path.basename(args.checkpoint)}"
+
+        cfg = inner_model.config
+        _, lm_rank = _build_basis(inner_model.lm_head.weight)
+        _, q_rank  = _build_basis(inner_model.q_head.weight)
+
+        wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=run_name,
+            config={
+                "checkpoint": args.checkpoint,
+                "data_path": data_path,
+                "batch_size": args.batch_size,
+                "num_steps": args.num_steps,
+                "mode": args.mode,
+                "hidden_size": cfg.hidden_size,
+                "vocab_size": cfg.vocab_size,
+                "seq_len": cfg.seq_len,
+                "puzzle_emb_ndim": cfg.puzzle_emb_ndim,
+                "puzzle_emb_len": inner_model.puzzle_emb_len,
+                "H_cycles": cfg.H_cycles,
+                "L_cycles": cfg.L_cycles,
+                "H_layers": cfg.H_layers,
+                "L_layers": cfg.L_layers,
+                "halt_max_steps": cfg.halt_max_steps,
+                "lm_head_rank": lm_rank,
+                "q_head_rank": q_rank,
+            },
+            settings=wandb.Settings(_disable_stats=True),
+        )
 
     if args.mode == "evaluate":
         print("Loading full model (ACTLossHead)...")
@@ -480,6 +709,7 @@ if __name__ == "__main__":
 
         # Register norm hooks on the inner model for benchmarking
         inner: HierarchicalReasoningModel_ACTV1_Inner = full_model.model.inner  # type: ignore[attr-defined]
+        _init_wandb(inner)
         norm_hook, norm_results = compute_residual_norms()
         inner.register_hook_H(norm_hook)
         inner.register_hook_L(norm_hook)
@@ -511,6 +741,7 @@ if __name__ == "__main__":
     else:  # inspect mode
         print("Loading model (inner)...")
         model = load_model(args.checkpoint, data_path=data_path)
+        _init_wandb(model)
 
         print(f"Loading data from {data_path}...")
         batches = load_sudoku_batch(data_path, batch_size=args.batch_size)
@@ -520,10 +751,13 @@ if __name__ == "__main__":
         # Register hooks
         pred_hook, pred_results = track_prediction_evolution(model, batch["labels"])
         norm_hook, norm_results = compute_residual_norms()
+        proj_hook, proj_results = compute_unembed_projection(model)
 
         model.register_hook_H(pred_hook)
         model.register_hook_H(norm_hook)
         model.register_hook_L(norm_hook)
+        model.register_hook_H(proj_hook)
+        model.register_hook_L(proj_hook)
 
         num_steps = args.num_steps or model.config.halt_max_steps
         print(f"Running {num_steps} ACT steps on batch of {batch['inputs'].shape[0]} puzzles...")
@@ -544,3 +778,24 @@ if __name__ == "__main__":
                   f"  {n['z_H_norm_mean']:>9.4f} {n['z_H_norm_std']:>8.4f} {n['z_H_norm_min']:>8.4f} {n['z_H_norm_max']:>8.4f}"
                   f"  {n['z_L_norm_mean']:>9.4f} {n['z_L_norm_std']:>8.4f} {n['z_L_norm_min']:>8.4f} {n['z_L_norm_max']:>8.4f}"
                   f"  {n['cosine_sim_mean']:>9.4f} {n['cosine_sim_std']:>8.4f} {n['cosine_sim_min']:>8.4f} {n['cosine_sim_max']:>8.4f}")
+
+        print("\n=== Unembedding Projection (grad-step only) ===")
+        print(f"  {'stream':>4} {'sub':>7} {'step':>4}"
+              f"  {'pos0 ratio':>10} {'pos0 std':>8}"
+              f"  {'seq ratio':>10} {'seq std':>8}"
+              f"  {'rank':>4}/{model.config.hidden_size}")
+        for r in proj_results:
+            if not r["is_grad_step"]:
+                continue
+            print(f"  {r['stream']:>4} {r['subspace']:>7} {r['act_step']:>4}"
+                  f"  {r['pos0_ratio_mean']:>10.4f} {r['pos0_ratio_std']:>8.4f}"
+                  f"  {r['seq_ratio_mean']:>10.4f} {r['seq_ratio_std']:>8.4f}"
+                  f"  {r['subspace_rank']:>4}/{r['hidden_size']}")
+
+        # ── Wandb logging ──
+        if args.wandb_project:
+            log_inspect_to_wandb(pred_results, norm_results, proj_results)
+
+    if args.wandb_project:
+        import wandb
+        wandb.finish()
