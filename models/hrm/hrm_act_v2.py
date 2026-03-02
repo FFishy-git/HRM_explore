@@ -32,6 +32,7 @@ class HookContext:
     is_grad_step: bool  # True for the final L+H calls (gradient-enabled in training)
     z_H: torch.Tensor   # [batch, seq+puzzle_emb_len, hidden_size]
     z_L: torch.Tensor   # [batch, seq+puzzle_emb_len, hidden_size]
+    input_embeddings: Optional[torch.Tensor] = None  # [batch, seq+puzzle_emb_len, hidden_size]
 
 
 HookCallback = Callable[[HookContext], None]
@@ -259,23 +260,23 @@ class HierarchicalReasoningModel_ACTV1_Inner(nn.Module):
                     if not ((_H_step == self.config.H_cycles - 1) and (_L_step == self.config.L_cycles - 1)):
                         z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
                         # V2: fire L hook
-                        self._fire_L(HookContext(act_step, _H_step, _L_step, False, z_H, z_L))
+                        self._fire_L(HookContext(act_step, _H_step, _L_step, False, z_H, z_L, input_embeddings))
 
                 if not (_H_step == self.config.H_cycles - 1):
                     z_H = self.H_level(z_H, z_L, **seq_info)
                     # V2: fire H hook
-                    self._fire_H(HookContext(act_step, _H_step, self.config.L_cycles - 1, False, z_H, z_L))
+                    self._fire_H(HookContext(act_step, _H_step, self.config.L_cycles - 1, False, z_H, z_L, input_embeddings))
 
         assert not z_H.requires_grad and not z_L.requires_grad
 
         # 1-step grad
         z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
         # V2: fire L hook (grad step)
-        self._fire_L(HookContext(act_step, self.config.H_cycles - 1, self.config.L_cycles - 1, True, z_H, z_L))
+        self._fire_L(HookContext(act_step, self.config.H_cycles - 1, self.config.L_cycles - 1, True, z_H, z_L, input_embeddings))
 
         z_H = self.H_level(z_H, z_L, **seq_info)
         # V2: fire H hook (grad step)
-        self._fire_H(HookContext(act_step, self.config.H_cycles - 1, self.config.L_cycles - 1, True, z_H, z_L))
+        self._fire_H(HookContext(act_step, self.config.H_cycles - 1, self.config.L_cycles - 1, True, z_H, z_L, input_embeddings))
 
         # LM Outputs
         new_carry = HierarchicalReasoningModel_ACTV1InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())  # New carry no grad

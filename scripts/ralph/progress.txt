@@ -1,0 +1,37 @@
+# Ralph Progress Log
+Started: Mon Mar  2 21:40:39 CST 2026
+---
+
+## Codebase Patterns
+- Weight initialization follows truncated LeCun normal: `trunc_normal_init_(tensor, std=1.0 / (in_features ** 0.5))` from `models/common.py`
+- Use `nn.Parameter` with `trunc_normal_init_` directly (see `CastedLinear` in `models/layers.py`)
+- Forward passes use `F.linear(input, weight, bias)` pattern rather than `nn.Linear` modules
+- No formal typecheck config (pyright/mypy) exists; use `python -m py_compile` for basic checks
+- HookContext dataclass uses `Optional[torch.Tensor] = None` for fields that should be backward-compatible (existing hooks ignore new fields)
+- `input_embeddings` is computed in `_Inner.forward()` at the start and passed to all HookContext sites
+- The `collect_residual_streams` hook in `hrm_inspect.py` constructs HookContext with keyword args — new fields must have defaults to avoid breaking it
+
+## 2026-03-02 - US-001
+- Implemented `ProbingMLP` class in `models/probing.py`
+- Architecture: Linear(d_in, hidden_mult*d_in) -> ReLU -> Linear(hidden_mult*d_in, 9)
+- d_in = 3 * hidden_size (default 1536), hidden_mult configurable (default 4), hidden_size configurable (default 512)
+- Output shape: [batch, seq, 9] for input [batch, seq, d_in]
+- Files changed: `models/probing.py` (new)
+- **Learnings for future iterations:**
+  - Codebase uses `F.linear` with `nn.Parameter` weights rather than `nn.Linear` modules
+  - `trunc_normal_init_` from `models/common.py` is the standard init pattern
+  - No pytest/test infrastructure exists yet; tests directory is empty
+  - Biases are zero-initialized following `CastedLinear` pattern
+---
+
+## 2026-03-02 - US-002
+- Added `input_embeddings: Optional[torch.Tensor] = None` field to HookContext dataclass in `models/hrm/hrm_act_v2.py`
+- Passed `input_embeddings` to all 4 HookContext construction sites (2 no-grad + 2 grad-step)
+- Existing hooks in `hrm_inspect.py` continue to work unchanged (field defaults to None)
+- Files changed: `models/hrm/hrm_act_v2.py`
+- **Learnings for future iterations:**
+  - HookContext uses positional args at construction sites in hrm_act_v2.py — new fields appended at end work with both positional and keyword styles
+  - `collect_residual_streams` in hrm_inspect.py constructs HookContext with keyword args — new fields MUST have defaults
+  - `input_embeddings` variable is in scope at all 4 hook sites because it's computed at the top of `forward()` (line 252)
+  - The `Optional[torch.Tensor] = None` pattern ensures backward compatibility while still passing the tensor when available
+---

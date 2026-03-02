@@ -1,0 +1,131 @@
+{
+  "project": "HRM_explore",
+  "branchName": "ralph/residual-stream-probing",
+  "description": "Residual Stream Probing Layer - Train a probing MLP to measure H-level information gain by comparing z_H (before) and z_H* (after) residual streams at each ACT step",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Implement the ProbingMLP module",
+      "description": "As a researcher, I want a probing MLP class so that I can decode digit predictions from concatenated residual streams.",
+      "acceptanceCriteria": [
+        "New file models/probing.py with a ProbingMLP class (nn.Module)",
+        "Architecture: Linear(d_in, hidden_mult*d_in) -> ReLU -> Linear(hidden_mult*d_in, 9) where d_in = 3 * hidden_size (default 1536)",
+        "Output is logits over 9 classes (digits 1-9), output shape [batch, seq, 9] for input [batch, seq, d_in]",
+        "hidden_mult is configurable (default 4), hidden_size is configurable (default 512)",
+        "Weight initialization uses trunc_normal_init_ following existing codebase conventions",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-002",
+      "title": "Extend HookContext with input_embeddings field",
+      "description": "As a researcher, I need access to input_embeddings inside hook callbacks so that probing and future hooks can use them without re-computing.",
+      "acceptanceCriteria": [
+        "Add input_embeddings: torch.Tensor field to the HookContext dataclass in hrm_act_v2.py",
+        "Pass input_embeddings (computed at the start of forward()) to every HookContext construction site (4 sites: 2 no-grad L/H hooks, 2 grad-step L/H hooks)",
+        "Existing hooks in hrm_inspect.py continue to work unchanged (they simply ignore the new field)",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-003",
+      "title": "Create probe_train.py with residual stream extraction hooks",
+      "description": "As a researcher, I need hook callbacks that capture z_H (before H-level) and z_H* (after H-level) plus z_L and input_embedding at each ACT step, so that I can feed them to the probe.",
+      "acceptanceCriteria": [
+        "New file probe_train.py with hook callback functions for residual stream extraction",
+        "L-hook callback captures z_H_before (ctx.z_H at last l_cycle, which is carry-in z_H before H-level call) and z_L (ctx.z_L at last l_cycle)",
+        "H-hook callback captures z_H_after (ctx.z_H at last h_cycle, which is z_H* after H-level call)",
+        "input_embeddings captured from ctx.input_embeddings (added in US-002)",
+        "Data collected for ACT steps >= skip_steps (default 2), skipping early steps where z_H/z_L are not yet stable",
+        "Extracted tensors are detached and optionally moved to CPU to avoid OOM",
+        "Hooks registered via existing register_hook_H / register_hook_L mechanism",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 3,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-004",
+      "title": "Implement probe training loop with CLI",
+      "description": "As a researcher, I want a training script that loads a frozen HRM checkpoint, extracts residual streams via hooks, and trains the probing MLP so I can measure H-level information gain.",
+      "acceptanceCriteria": [
+        "CLI interface in probe_train.py with argparse: --checkpoint, --data, --lr (default 1e-3), --weight-decay (default 1e-2), --epochs, --batch-size, --act-steps, --skip-act-steps (default 2), --mode train/eval",
+        "Loads frozen HRM checkpoint using existing load_model() from hrm_inspect.py, sets eval() and requires_grad_(False)",
+        "For each batch: runs HRM forward with hooks, forms probe inputs concat(z_H, z_L, input_emb) and concat(z_H*, z_L, input_emb) along hidden dim -> [batch, 81, 1536] (strips puzzle prefix position 0)",
+        "Passes both inputs through the SAME ProbingMLP -> logits [batch, 81, 9]",
+        "Cross-entropy loss computed on blank cells only (where inputs == 1); target labels remapped from tokens 2-10 to classes 0-8",
+        "Combined loss = loss(z_H input) + loss(z_H* input), both contribute gradients to same probe",
+        "AdamW optimizer on probe parameters only with configurable lr and weight_decay",
+        "Logs training loss and accuracy per epoch to stdout and optionally to Wandb",
+        "Runnable as: python probe_train.py --checkpoint <path> --data <path> --mode train",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 4,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-005",
+      "title": "Add probe evaluation mode with per-step metrics",
+      "description": "As a researcher, I want to evaluate the trained probe and see per-ACT-step accuracy for z_H vs z_H*, so I can quantify H-level information gain.",
+      "acceptanceCriteria": [
+        "Evaluation mode activated via --mode eval in probe_train.py",
+        "Reports per-ACT-step metrics separately for z_H and z_H* (for steps >= skip_steps): per-cell accuracy on blank cells, cross-entropy loss, and accuracy delta acc(z_H*) - acc(z_H)",
+        "Prints a summary table: ACT step x {z_H acc, z_H* acc, delta} starting from the configured skip step",
+        "Optionally logs metrics to Wandb with step-indexed keys",
+        "Requires --probe-checkpoint flag to load a saved probe",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 5,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-006",
+      "title": "Add probe checkpoint saving and loading",
+      "description": "As a researcher, I want to save and load trained probe weights so I can reuse them without retraining.",
+      "acceptanceCriteria": [
+        "Saves probe state_dict + config (hidden_size, hidden_mult, num_classes) to a .pt checkpoint file",
+        "Saves at configurable interval (--save-interval) and always at end of training",
+        "Loading reconstructs ProbingMLP architecture from saved config, then loads state_dict",
+        "CLI flag --probe-checkpoint to resume training or run eval from a saved probe",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 6,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-007",
+      "title": "Add unit tests for probe module and data pipeline",
+      "description": "As a developer, I want tests for the probing MLP and the data remapping logic so that correctness is verified.",
+      "acceptanceCriteria": [
+        "New file tests/test_probing.py",
+        "Test that ProbingMLP output shape is [batch, seq, 9] for input shape [batch, seq, 1536]",
+        "Test that target label remapping converts tokens 2-10 to classes 0-8 correctly",
+        "Test that blank cell mask correctly identifies cells where inputs == 1",
+        "Test that loss is computed only on masked (blank) cells and given cells do not contribute to loss",
+        "Test that probe gradients flow only to probe parameters, not HRM parameters",
+        "pytest tests/test_probing.py passes",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 7,
+      "passes": false,
+      "notes": ""
+    }
+  ]
+}
