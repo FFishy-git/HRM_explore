@@ -1,0 +1,128 @@
+# Ralph Progress Log
+Started: Mon Mar  2 21:40:39 CST 2026
+---
+
+## Codebase Patterns
+- Weight initialization follows truncated LeCun normal: `trunc_normal_init_(tensor, std=1.0 / (in_features ** 0.5))` from `models/common.py`
+- Use `nn.Parameter` with `trunc_normal_init_` directly (see `CastedLinear` in `models/layers.py`)
+- Forward passes use `F.linear(input, weight, bias)` pattern rather than `nn.Linear` modules
+- No formal typecheck config (pyright/mypy) exists; use `python -m py_compile` for basic checks
+- HookContext dataclass uses `Optional[torch.Tensor] = None` for fields that should be backward-compatible (existing hooks ignore new fields)
+- `input_embeddings` is computed in `_Inner.forward()` at the start and passed to all HookContext sites
+- The `collect_residual_streams` hook in `hrm_inspect.py` constructs HookContext with keyword args — new fields must have defaults to avoid breaking it
+- In forward(), grad-step L-hook fires before H-level (ctx.z_H = z_H_before), grad-step H-hook fires after H-level (ctx.z_H = z_H_after/z_H*)
+- Manual ACT loop pattern: `model.empty_carry(batch_size)` → `model.reset_carry(ones, carry)` → loop `model(carry, batch, act_step=step)`
+- Residual streams have shape [batch, seq_len + puzzle_emb_len, hidden]; strip puzzle_emb_len prefix to align with labels [batch, seq_len]
+- Blank cells in Sudoku: `inputs == 1`; digit labels are tokens 2-10 → remap to classes 0-8 via `labels - 2`
+- For CPU-local pytest: mock `flash_attn_interface` and `flash_attn` in `tests/conftest.py` via `sys.modules`
+- Run tests with `python -m pytest tests/ -v`; typecheck with `python -m py_compile <file>`
+
+## 2026-03-02 - US-001
+- Implemented `ProbingMLP` class in `models/probing.py`
+- Architecture: Linear(d_in, hidden_mult*d_in) -> ReLU -> Linear(hidden_mult*d_in, 9)
+- d_in = 3 * hidden_size (default 1536), hidden_mult configurable (default 4), hidden_size configurable (default 512)
+- Output shape: [batch, seq, 9] for input [batch, seq, d_in]
+- Files changed: `models/probing.py` (new)
+- **Learnings for future iterations:**
+  - Codebase uses `F.linear` with `nn.Parameter` weights rather than `nn.Linear` modules
+  - `trunc_normal_init_` from `models/common.py` is the standard init pattern
+  - No pytest/test infrastructure exists yet; tests directory is empty
+  - Biases are zero-initialized following `CastedLinear` pattern
+---
+
+## 2026-03-02 - US-002
+- Added `input_embeddings: Optional[torch.Tensor] = None` field to HookContext dataclass in `models/hrm/hrm_act_v2.py`
+- Passed `input_embeddings` to all 4 HookContext construction sites (2 no-grad + 2 grad-step)
+- Existing hooks in `hrm_inspect.py` continue to work unchanged (field defaults to None)
+- Files changed: `models/hrm/hrm_act_v2.py`
+- **Learnings for future iterations:**
+  - HookContext uses positional args at construction sites in hrm_act_v2.py — new fields appended at end work with both positional and keyword styles
+  - `collect_residual_streams` in hrm_inspect.py constructs HookContext with keyword args — new fields MUST have defaults
+  - `input_embeddings` variable is in scope at all 4 hook sites because it's computed at the top of `forward()` (line 252)
+  - The `Optional[torch.Tensor] = None` pattern ensures backward compatibility while still passing the tensor when available
+---
+
+## 2026-03-02 - US-003
+- Created `probe_train.py` with residual stream extraction hooks
+- `ProbeData` dataclass holds z_H_before, z_H_after, z_L, input_embeddings per ACT step
+- `create_probe_hooks(skip_steps, to_cpu)` returns L and H hook callbacks plus storage list
+- L-hook captures z_H_before (carry-in z_H before H-level) and z_L at grad-step
+- H-hook captures z_H_after (z_H* after H-level) at grad-step, assembles ProbeData
+- Uses _pending dict to buffer L-hook data until H-hook fires for same ACT step
+- Tensors are detached and optionally moved to CPU to avoid OOM
+- Files changed: `probe_train.py` (new)
+- **Learnings for future iterations:**
+  - In hrm_act_v2.py forward(), grad-step L-hook fires BEFORE H-level, so ctx.z_H is the carry-in z_H_before
+  - Grad-step H-hook fires AFTER H-level, so ctx.z_H is z_H* (z_H_after)
+  - L-hook always fires before H-hook within the same ACT step (line 273-279), making _pending buffer safe
+  - input_embeddings can be None if an older checkpoint's hooks are used; guard with fallback
+---
+
+## 2026-03-02 - US-004
+- Implemented probe training loop with CLI in `probe_train.py`
+- CLI interface with argparse: --checkpoint, --data, --lr (1e-3), --weight-decay (1e-2), --epochs, --batch-size, --act-steps, --skip-act-steps (2), --mode train/eval
+- Loads frozen HRM via `load_model()` from hrm_inspect.py, sets eval() and requires_grad_(False)
+- For each batch: runs ACT loop with hooks via `_run_act_loop_with_hooks()`, collects ProbeData
+- Forms probe inputs: concat(z_H, z_L, input_emb) and concat(z_H*, z_L, input_emb) along hidden dim, strips puzzle_emb_len prefix
+- Cross-entropy loss on blank cells only (inputs == 1), labels remapped from tokens 2-10 to classes 0-8
+- Combined loss = loss(z_H) + loss(z_H*), averaged across ACT steps per batch
+- AdamW optimizer on probe params only, saves probe checkpoint at end
+- Logs loss, acc(z_H), acc(z_H*), delta per epoch to stdout and optionally wandb
+- Runnable as: python probe_train.py --checkpoint <path> --data <path> --mode train
+- Files changed: `probe_train.py` (extended)
+- **Learnings for future iterations:**
+  - `run_act_loop` in hrm_inspect.py uses `model.empty_carry(batch_size)` + `model.reset_carry()` pattern for manual ACT loop
+  - Hooks are registered/unregistered per batch via register_hook_L/H returning remove() functions — use try/finally to ensure cleanup
+  - Residual streams include puzzle_emb_len prefix positions that must be stripped to align with labels shape
+  - `load_sudoku_batch(split="train")` iterates once through the dataset; re-create per epoch
+  - flash_attn is GPU-only; `py_compile` is the local quality check, runtime tests need GPU
+  - Probe checkpoint saves both state_dict and config for reconstruction (hidden_size, hidden_mult, num_classes)
+---
+
+## 2026-03-02 - US-005
+- Implemented `eval_probe()` function in `probe_train.py` for per-ACT-step evaluation
+- Evaluation mode activated via `--mode eval`, requires `--probe-checkpoint`
+- Loads probe from saved checkpoint (reconstructs architecture from config + loads state_dict)
+- Runs frozen HRM with hooks, accumulates per-ACT-step metrics across all batches
+- Reports summary table with columns: ACT Step, acc(z_H), acc(z_H*), delta, loss(z_H), loss(z_H*)
+- Overall summary row averages across all steps
+- Optionally logs per-step metrics to wandb with step-indexed keys (e.g., eval/step_2/acc_z_H)
+- Wired up CLI: `--mode eval` now calls `eval_probe(args)` instead of error placeholder
+- Files changed: `probe_train.py` (extended with ~100 lines)
+- **Learnings for future iterations:**
+  - `_compute_probe_loss` returns (loss_tensor, acc_float); in eval with torch.no_grad(), loss.item() still works fine
+  - Per-step metric accumulation pattern: Dict[int, Dict[str, float]] with count field for averaging
+  - Probe must be set to eval() mode for evaluation to disable any dropout/batchnorm (none currently, but good practice)
+  - The same `_run_act_loop_with_hooks` and `_form_probe_inputs` helpers used in training work directly for eval
+---
+
+## 2026-03-02 - US-006
+- Added `--save-interval` CLI flag for configurable interval checkpoint saving
+- Interval saving creates `<output>_epoch<N>.pt` files; final checkpoint always saved at end
+- Fixed resume training (`--probe-checkpoint` in train mode) to reconstruct probe architecture from saved config, matching the eval_probe pattern
+- `_save_probe()` was already saving state_dict + config (hidden_size, hidden_mult, num_classes)
+- `--probe-checkpoint` flag and `--output` flag already existed from US-004/005
+- Files changed: `probe_train.py` (3 edits: CLI flag, interval save logic, resume-from-config)
+- **Learnings for future iterations:**
+  - Most of US-006 was already implemented across US-004 and US-005 (save at end, load for eval, CLI flags)
+  - The key missing piece was interval saving and consistent config-based reconstruction on resume
+  - `args.output.replace(".pt", f"_epoch{N}.pt")` is a simple pattern for interval checkpoint naming
+  - `args.save_interval` maps from `--save-interval` (argparse converts hyphens to underscores)
+---
+
+## 2026-03-02 - US-007
+- Created `tests/test_probing.py` with 14 unit tests across 5 test classes
+- Created `tests/conftest.py` to mock GPU-only `flash_attn` dependencies for CPU testing
+- TestProbingMLPShape: output shape [batch, seq, 9], custom hidden_size, single position, logits unbounded
+- TestLabelRemapping: tokens 2-10 → classes 0-8 via `labels - 2`
+- TestBlankCellMask: blank (inputs == 1), no blanks, all blanks
+- TestLossOnBlankCells: loss only on blanks, given cells don't affect loss, empty mask → zero loss
+- TestGradientIsolation: gradients flow to probe only (not HRM), detached inputs block upstream gradients
+- All 14 tests pass, all files pass py_compile typecheck
+- Files changed: `tests/test_probing.py` (new), `tests/conftest.py` (new)
+- **Learnings for future iterations:**
+  - `flash_attn` is GPU-only; mock it in `tests/conftest.py` via `sys.modules` to enable CPU testing
+  - pytest conftest.py runs before test module collection, so mocking there works for transitive imports
+  - `_compute_probe_loss` from `probe_train.py` is the key testable unit — it encapsulates loss masking + label remapping + accuracy computation
+  - To test gradient isolation, simulate frozen HRM with `.detach()` on tensors (same as real hook pipeline)
+---
