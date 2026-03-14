@@ -116,7 +116,7 @@ def _run_act_loop_with_hooks(
     remove_l = model.register_hook_L(hooks_dict['L'])
     remove_h = model.register_hook_H(hooks_dict['H'])
     try:
-        with torch.no_grad():
+        with torch.no_grad(), torch.device(device):
             carry = model.empty_carry(batch_size)
             carry = model.reset_carry(
                 torch.ones(batch_size, dtype=torch.bool, device=device),
@@ -155,8 +155,8 @@ def _compute_probe_loss(
     inputs: torch.Tensor,
     labels: torch.Tensor,
     blank_mask: torch.Tensor,
-) -> tuple[torch.Tensor, float]:
-    """Compute cross-entropy loss and accuracy on blank cells only.
+) -> tuple[torch.Tensor, float, float]:
+    """Compute cross-entropy loss, accuracy, and entropy on blank cells only.
 
     Args:
         probe: The probing MLP.
@@ -165,7 +165,8 @@ def _compute_probe_loss(
         blank_mask: [batch, seq] boolean mask where inputs == 1 (blank cells).
 
     Returns:
-        (loss, accuracy) where loss is a scalar tensor and accuracy is a float.
+        (loss, accuracy, entropy) where loss is a scalar tensor and
+        accuracy/entropy are floats.
     """
     logits = probe(inputs.float())  # [batch, seq, 9]
     # Remap label tokens 2-10 -> classes 0-8
@@ -175,15 +176,18 @@ def _compute_probe_loss(
     target_flat = target[blank_mask]   # [num_blank]
 
     if logits_flat.numel() == 0:
-        return torch.tensor(0.0, device=inputs.device, requires_grad=True), 0.0
+        return torch.tensor(0.0, device=inputs.device, requires_grad=True), 0.0, 0.0
 
     loss = F.cross_entropy(logits_flat, target_flat.long())
 
     with torch.no_grad():
         preds = logits_flat.argmax(dim=-1)
         acc = (preds == target_flat).float().mean().item()
+        # Entropy of the probe's softmax distribution (nats)
+        probs = F.softmax(logits_flat.float(), dim=-1)
+        ent = -(probs * probs.clamp_min(1e-10).log()).sum(dim=-1).mean().item()
 
-    return loss, acc
+    return loss, acc, ent
 
 
 # ──────────────────────── Training loop ───────────────────────────────────
@@ -240,13 +244,19 @@ def train_probe(args) -> None:
     num_steps = args.act_steps if args.act_steps else model.config.halt_max_steps
     print(f"Training for {args.epochs} epochs, act_steps={num_steps}, skip_steps={args.skip_act_steps}")
 
+    global_step = 0
     for epoch in range(args.epochs):
         epoch_loss = 0.0
         epoch_acc_before = 0.0
         epoch_acc_after = 0.0
+        epoch_ent_before = 0.0
+        epoch_ent_after = 0.0
         num_batches = 0
 
         for batch in load_sudoku_batch(args.data, batch_size=args.batch_size, split="train"):
+            if args.max_batches > 0 and num_batches >= args.max_batches:
+                break
+
             # Move batch to device
             batch = {k: v.to(device) for k, v in batch.items()}
 
@@ -265,16 +275,20 @@ def train_probe(args) -> None:
             step_count = 0
             batch_acc_before = 0.0
             batch_acc_after = 0.0
+            batch_ent_before = 0.0
+            batch_ent_after = 0.0
 
             for probe_data in storage:
                 before_input, after_input = _form_probe_inputs(probe_data, puzzle_emb_len, device)
 
-                loss_before, acc_before = _compute_probe_loss(probe, before_input, labels, blank_mask)
-                loss_after, acc_after = _compute_probe_loss(probe, after_input, labels, blank_mask)
+                loss_before, acc_before, ent_before = _compute_probe_loss(probe, before_input, labels, blank_mask)
+                loss_after, acc_after, ent_after = _compute_probe_loss(probe, after_input, labels, blank_mask)
 
                 total_loss = total_loss + loss_before + loss_after
                 batch_acc_before += acc_before
                 batch_acc_after += acc_after
+                batch_ent_before += ent_before
+                batch_ent_after += ent_after
                 step_count += 1
 
             if step_count > 0:
@@ -283,31 +297,70 @@ def train_probe(args) -> None:
                 avg_loss.backward()
                 optimizer.step()
 
+                b_acc_before = batch_acc_before / step_count
+                b_acc_after = batch_acc_after / step_count
+                b_ent_before = batch_ent_before / step_count
+                b_ent_after = batch_ent_after / step_count
+
                 epoch_loss += avg_loss.item()
-                epoch_acc_before += batch_acc_before / step_count
-                epoch_acc_after += batch_acc_after / step_count
+                epoch_acc_before += b_acc_before
+                epoch_acc_after += b_acc_after
+                epoch_ent_before += b_ent_before
+                epoch_ent_after += b_ent_after
                 num_batches += 1
+                global_step += 1
+
+                if use_wandb:
+                    import wandb
+                    wandb.log({
+                        "batch/loss": avg_loss.item(),
+                        "batch/acc_z_H": b_acc_before,
+                        "batch/acc_z_H_star": b_acc_after,
+                        "batch/acc_delta": b_acc_after - b_acc_before,
+                        "batch/entropy_z_H": b_ent_before,
+                        "batch/entropy_z_H_star": b_ent_after,
+                        "batch/entropy_delta": b_ent_before - b_ent_after,
+                        "batch/epoch": epoch,
+                    }, step=global_step)
+
+                if args.log_interval > 0 and num_batches % args.log_interval == 0:
+                    print(
+                        f"  [batch {num_batches}] "
+                        f"loss={avg_loss.item():.4f}  "
+                        f"acc(z_H)={b_acc_before:.4f}  "
+                        f"acc(z_H*)={b_acc_after:.4f}  "
+                        f"H(z_H)={b_ent_before:.4f}  "
+                        f"H(z_H*)={b_ent_after:.4f}"
+                    )
 
         # Epoch summary
         if num_batches > 0:
             avg_epoch_loss = epoch_loss / num_batches
             avg_epoch_acc_before = epoch_acc_before / num_batches
             avg_epoch_acc_after = epoch_acc_after / num_batches
+            avg_epoch_ent_before = epoch_ent_before / num_batches
+            avg_epoch_ent_after = epoch_ent_after / num_batches
             print(
                 f"Epoch {epoch+1}/{args.epochs}  "
                 f"loss={avg_epoch_loss:.4f}  "
                 f"acc(z_H)={avg_epoch_acc_before:.4f}  "
                 f"acc(z_H*)={avg_epoch_acc_after:.4f}  "
-                f"delta={avg_epoch_acc_after - avg_epoch_acc_before:.4f}"
+                f"delta_acc={avg_epoch_acc_after - avg_epoch_acc_before:.4f}  "
+                f"H(z_H)={avg_epoch_ent_before:.4f}  "
+                f"H(z_H*)={avg_epoch_ent_after:.4f}  "
+                f"delta_H={avg_epoch_ent_before - avg_epoch_ent_after:.4f}"
             )
             if use_wandb:
                 import wandb
                 wandb.log({
-                    "train/loss": avg_epoch_loss,
-                    "train/acc_z_H": avg_epoch_acc_before,
-                    "train/acc_z_H_star": avg_epoch_acc_after,
-                    "train/acc_delta": avg_epoch_acc_after - avg_epoch_acc_before,
-                }, step=epoch)
+                    "epoch/loss": avg_epoch_loss,
+                    "epoch/acc_z_H": avg_epoch_acc_before,
+                    "epoch/acc_z_H_star": avg_epoch_acc_after,
+                    "epoch/acc_delta": avg_epoch_acc_after - avg_epoch_acc_before,
+                    "epoch/entropy_z_H": avg_epoch_ent_before,
+                    "epoch/entropy_z_H_star": avg_epoch_ent_after,
+                    "epoch/entropy_delta": avg_epoch_ent_before - avg_epoch_ent_after,
+                }, step=global_step)
         else:
             print(f"Epoch {epoch+1}/{args.epochs}  no data collected")
 
@@ -396,13 +449,14 @@ def eval_probe(args) -> None:
                 step = probe_data.act_step
                 before_input, after_input = _form_probe_inputs(probe_data, puzzle_emb_len, device)
 
-                loss_before, acc_before = _compute_probe_loss(probe, before_input, labels, blank_mask)
-                loss_after, acc_after = _compute_probe_loss(probe, after_input, labels, blank_mask)
+                loss_before, acc_before, ent_before = _compute_probe_loss(probe, before_input, labels, blank_mask)
+                loss_after, acc_after, ent_after = _compute_probe_loss(probe, after_input, labels, blank_mask)
 
                 if step not in step_metrics:
                     step_metrics[step] = {
                         "loss_before": 0.0, "loss_after": 0.0,
                         "acc_before": 0.0, "acc_after": 0.0,
+                        "ent_before": 0.0, "ent_after": 0.0,
                         "count": 0.0,
                     }
                 m = step_metrics[step]
@@ -410,6 +464,8 @@ def eval_probe(args) -> None:
                 m["loss_after"] += loss_after.item()
                 m["acc_before"] += acc_before
                 m["acc_after"] += acc_after
+                m["ent_before"] += ent_before
+                m["ent_after"] += ent_after
                 m["count"] += 1
 
     # --- Print summary table ---
@@ -520,6 +576,10 @@ if __name__ == "__main__":
                         help="Output path for probe checkpoint (default: probe_checkpoint.pt)")
     parser.add_argument("--save-interval", type=int, default=0,
                         help="Save probe checkpoint every N epochs (0 = only at end, default: 0)")
+    parser.add_argument("--max-batches", type=int, default=0,
+                        help="Max batches per epoch (0 = all, default: 0)")
+    parser.add_argument("--log-interval", type=int, default=10,
+                        help="Print progress every N batches (default: 10)")
 
     # Wandb
     parser.add_argument("--wandb-project", type=str, default=None,
